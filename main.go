@@ -1,7 +1,7 @@
 package main
 
 import (
-	"fmt"
+	"database/sql"
 	"log"
 	"net/http"
 	"os"
@@ -11,18 +11,39 @@ import (
 	"github.com/go-chi/chi/middleware"
 	"github.com/go-chi/cors"
 	"github.com/joho/godotenv"
+	"github.com/sugoiServal/go-rss/internal/database"
+
+	_ "github.com/lib/pq"
 )
 
-func greet(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "Hello World! %s", time.Now())
+type apiConfig struct {
+	DB *database.Queries
 }
 
 func main() {
+	// get env vars
 	godotenv.Load(".env")
 	portStr := os.Getenv("PORT")
+	dbStr := os.Getenv("DB_URL")
 	if portStr == "" {
 		log.Fatal("PORT is not found in Env Variable")
 	}
+	if dbStr == "" {
+		log.Fatal("DB_URL is not found in Env Variable")
+	}
+
+	// connect to db
+	db, err := sql.Open("postgres", dbStr)
+	if err != nil {
+		log.Fatal("Cannot connect to db:", err)
+	}
+	log.Println("connected to db")
+	queries := database.New(db)
+	apiCfg := apiConfig{
+		DB: queries,
+	}
+	go startScraping(queries, 10, 30*time.Minute)
+	// create main router: r
 	r := chi.NewRouter()
 	r.Use(cors.Handler(cors.Options{
 		// AllowedOrigins:   []string{"https://foo.com"}, // Use this to allow specific origin hosts
@@ -34,36 +55,39 @@ func main() {
 		AllowCredentials: false,
 		MaxAge:           300, // Maximum value not ignored by any of major browsers
 	}))
-
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 
-	// Define routes
-	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Hello, Chi Router!\n"))
-		fmt.Fprintf(w, "%s", time.Now()) // alt way to write res
-	})
-
 	// v1-Router (/v1/)
 	v1Router := chi.NewRouter()
+
+	// health check
 	v1Router.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		respondWithJson(w, 200, struct{}{})
 	})
 	v1Router.Get("/client-err", func(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, 400, "Something went wrong")
 	})
+
+	// user
+	v1Router.Post("/users", apiCfg.handlerUsersCreate)
+	v1Router.Get("/users", apiCfg.middlewareAuth(apiCfg.handlerUserGet))
+
+	// feed
+	v1Router.Post("/feeds", apiCfg.middlewareAuth(apiCfg.handlerFeedCreate))
+	v1Router.Get("/feeds", apiCfg.handlerFeedGet)
+
+	// follow feed
+	v1Router.Post("/feed-follow", apiCfg.middlewareAuth(apiCfg.handlerCreateFeedFollow))
+	v1Router.Get("/feed-follow", apiCfg.middlewareAuth(apiCfg.handlerFeedFollowsGet))
+	v1Router.Delete("/feed-follow/{followID}", apiCfg.middlewareAuth(apiCfg.handlerFeedFollowsDelete))
+
+	// post
+	v1Router.Get("/posts", apiCfg.middlewareAuth(apiCfg.handlerGetPostForUser))
+
 	r.Mount("/v1", v1Router)
 
-	// Sub-router (/auth/login)
-	authRouter := chi.NewRouter()
-	authRouter.Get("/login", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("login"))
-	})
-	r.Mount("/auth", authRouter)
-
 	log.Printf("Server starting on port %v", portStr)
-	err := http.ListenAndServe(":"+portStr, r)
-	if err != nil {
-		log.Fatal(err)
-	}
+	http.ListenAndServe(":"+portStr, r)
+
 }
